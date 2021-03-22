@@ -1,0 +1,192 @@
+---
+title: "PEcAn API tutorial"
+author: "Alexey Shiklomanov, Rob Kooper"
+date: "2021-03-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Pretty-print long IDs
+options(scipen = 12, pillar.sigfig = 12)
+```
+
+NOTE: Disconnect from VPN before trying this!
+Rob's servers look very suspicious to corporate VPNs.
+
+These are Rob's PEcAn test servers.
+
+```{r}
+ip1 <- "ZZZ.ZZZ.ZZZ.ZZZ"
+```
+
+The full URL is `http://<IP address>`.
+
+```{r}
+library(rpecanapi)
+url <- sprintf("http://%s", ip1)
+print(url)
+```
+
+Connect to the server and test the connection.
+Normally, there would be authentication here, but these test servers have no authentication.
+
+```{r}
+server <- connect(url)
+ping(server)
+get.status(server)
+```
+
+Here, we see what models are available.
+This endpoint doesn't have an R frontend yet, so we access it directly using `httr`.
+
+```{r}
+library(httr)
+library(dplyr)
+
+models <- GET(file.path(server$url, "api", "availableModels/")) %>%
+  content() %>%
+  bind_rows()
+
+models
+```
+
+For our first test, we'll use SIPNET.
+We can extract its model ID from the `models` query output above. 
+
+```{r}
+sipnet_id <- models %>%
+  filter(model_name == "SIPNET") %>%
+  pull(model_id)
+
+get.model(server, sipnet_id)
+```
+
+We can use the API `search.sites` function to search for sites.
+
+```{r}
+search.sites(server, "Harvard")
+```
+
+I happen to know the Harvard Forest ID, so we'll just use that here.
+`get.site` tells us a bit more about the site.
+
+```{r}
+# Harvard Forest
+site_id <- 646
+get.site(server, site_id)
+```
+
+Now, we have everything we need to submit the workflow.
+Note that this runs fairly quickly because the MERRA data are already downloaded.
+
+```{r}
+wf <- submit.workflow(
+  server, sipnet_id, site_id,
+  pfts = "temperate.coniferous",
+  start_date = "2012-06-01",
+  end_date = "2012-08-01",
+  inputs = list(met = list(source = "MERRA"))
+)
+wf
+```
+
+Use the URL below to track progress:
+
+```{r}
+print(file.path(
+  server$url,
+  "pecan",
+  sprintf("05-running.php?workflowid=%s&hostname=docker", wf$workflow_id)
+))
+```
+
+Once the run has finished, we can check its status and look at some outputs.
+
+```{r}
+rpecanapi::get.workflow.status(server, wf$workflow_id)
+
+runs <- rpecanapi::get.runs(server, wf$workflow_id)
+runid <- runs$runs$id
+rpecanapi::plot_run_vars(server, runid, 2012, "GPP")
+```
+
+We can also download the outputs directly for more sophisticated analysis.
+
+```{r}
+rpecanapi::download.run.output(server, runid, "2012.nc")
+
+library(ncdf4)
+nc <- nc_open("2012.nc")
+gpp <- ncvar_get(nc, "GPP")
+npp <- ncvar_get(nc, "NPP")
+resp <- ncvar_get(nc, "TotalResp")
+dtime <- ncvar_get(nc, "time")
+time <- as.POSIXct("2020-01-01 00:00:00", tz="UTC") + as.difftime(dtime, units = "days")
+
+clrs <- c("green4", "brown", "blue")
+matplot(time, cbind(gpp, resp, npp), type = "l", lty = "solid", col = clrs,
+        xlab = "Time", ylab = expression("Flux" ~ (kg * C ~ m^-2 ~ s^-1)))
+abline(h = 0, lty = "dashed", col = "black")
+legend("topleft", c("GPP", "TotResp", "NPP"), lty = "solid", col = clrs)
+```
+
+Let's try a more complex example with ED2.
+This requires more configuration because ED2 requires a lot more inputs.
+Note that the argument `inputs` targets the inputs section of the XML,
+while `workflow_list_mods` can be used to arbitrarily modify _any_ part of the XML
+(based on base R's `modifyList` function).
+(In principle, you could provide nonsense to all the other arguments and 
+pass all information using the `workflow_list_mods` argument).
+
+```{r}
+ed_id <- models %>%
+  filter(model_name == "ED2.2") %>%
+  pull(model_id)
+
+wf2 <- submit.workflow(
+  server, ed_id, site_id,
+  pfts = "temperate.Early_Hardwood",
+  start_date = "2012-06-01",
+  end_date = "2012-06-30",
+  # Passed directly into the `inputs` tag
+  inputs = list(met = list(source = "MERRA"),
+                lu = list(id = 294),
+                thsum = list(id = 295),
+                veg = list(id = 296),
+                soil = list(id = 297)),
+  # Passed to `modifyList` to modify the list representation of the workflow XML
+  workflow_list_mods = list(model = list(
+    phenol.scheme = 0,
+    ed_misc = list(output_month = 12),
+    edin = "ED2IN.r2.2.0"
+  ))
+)
+wf2
+```
+
+Again, follow along using this URL.
+
+```{r}
+print(file.path(
+  server$url,
+  "pecan",
+  sprintf("05-running.php?workflowid=%s&hostname=docker", wf2$workflow_id)
+))
+```
+
+ED2 post processing doesn't fully work.
+
+```{r}
+runs <- rpecanapi::get.runs(server, wf2$workflow_id)
+runid <- runs$runs$id
+rpecanapi::download.run.output(server, runid, "analysis-T-2012-00-00-000000-g01.h5")
+```
+
+```{r}
+nc2 <- nc_open("analysis-T-2012-00-00-000000-g01.h5")
+gpp <- ncvar_get(nc2, "FMEAN_GPP_PY")
+time <- as.POSIXct("2012-06-01 00:00:00", "UTC") + as.difftime(seq_along(gpp), units = "hours")
+ii <- time < "2012-07-01"
+plot(time[ii], gpp[ii], type = "l")
+```
